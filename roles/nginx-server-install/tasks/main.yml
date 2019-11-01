@@ -1,0 +1,229 @@
+---
+
+- name: "Show the number of CPU/cores on this server"
+  debug:
+    msg: "ansible_processor_count : {{ ansible_processor_count }} - ansible_processor_cores : {{ ansible_processor_cores }}"
+  changed_when: False
+
+- name: If we found the number of CPU cores, save it to a new variable
+  set_facts:
+   nb_cpu: "{{ ansible_processor_cores }}"
+  when: ansible_processor_cores != "NA"
+
+- name: If not, take the value of CPU Count
+  set_facts:
+   nb_cpu: "{{ ansible_processor_count }}"
+  when: ansible_processor_cores == "NA"
+
+- name: "Determine the number of maximum open files supported by this server"
+  shell: "ulimit -n"
+  register: nb_max_open_files
+  changed_when: False
+
+- name: "Calculate the number of worker_connections"
+  shell: "echo \"(({{ nb_cpu }} * {{ nb_max_open_files.stdout }}))\" | bc "
+  register: worker_connections
+  changed_when: False
+
+- name: "Show the numbers for the workers that we found"
+  vars:
+    msg: |
+      "worker_processes : {{ nb_cpu }}"
+      "worker_connections : {{ worker_connections.stdout }}"
+  debug:
+    msg: "{{ msg.split('\n') }}"
+
+- name: "[UBUNTU/DEBIAN] Update apt cache"
+  apt:
+    update_cache: yes
+    cache_valid_time: 86400
+  when: ansible_os_family == "Debian"
+
+- name: "[UBUNTU/DEBIAN] Install nginx with apt"
+  apt:
+    name: nginx
+    state: present
+  when: ansible_os_family == "Debian"
+
+- name: "[RedHat/CentOS/AmazonLinux] Install nginx with yum"
+  yum:
+    name: nginx
+    state: present
+  when: ansible_os_family == "RedHat"
+
+- name: "Create the folders needed for nginx"
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+  with_items:
+    - /etc/nginx/streams.d
+    - /etc/nginx/sites-enabled
+    - /etc/nginx/sites-available
+
+- name: "Make sure that the /etc/ssl/nginx folder exists"
+  file:
+    name: "/etc/ssl/nginx"
+    state: directory
+
+- name: "Enable nginx as service"
+  service:
+    name: nginx
+    enabled: yes
+
+- name: Generate the date and time of now
+  shell: echo `date +"%Y%m%d-%H%M%S"`
+  register: now
+  changed_when: False
+
+- name: Do a backup of nginx config
+  shell: "cp /etc/nginx/nginx.conf /etc/nginx/nginx_{{ now.stdout }}.conf.bak"
+  changed_when: False
+
+- name: "Disable the Default site in /etc/nginx/sites-enabled"
+  file:
+    path: /etc/nginx/sites-enabled/default 
+    state: absent
+
+- name: "Read the content of /etc/nginx/nginx.conf"
+  shell: "cat /etc/nginx/nginx.conf | grep -v 'ANSIBLE MANAGED BLOCK'"
+  register: nginx_conf
+  changed_when: False
+
+- name: "If there are comments in the file nginx.conf, remove them, and also clean the empty lines"
+  shell: "cat /etc/nginx/nginx.conf | sed -e 's/#.*//g' | sed -e 's/^[ \\t]*$//g' > /etc/nginx/nginx.conf.clean"
+  when: nginx_conf.stdout.find('#') != -1
+  changed_when: False
+
+- name: "If there are no comments in the file nginx.conf, just clean the empty lines"
+  shell: "cat /etc/nginx/nginx.conf | sed -e 's/^[ \\t]*$//g'  > /etc/nginx/nginx.conf.clean"
+  when: nginx_conf.stdout.find('#') == -1
+  changed_when: False
+
+- name: "Removing the location blocks from /etc/nginx/nginx.conf"
+  shell: "cat /etc/nginx/nginx.conf.clean | awk \"/location/,/}$/ {next}1\" > /etc/nginx/nginx.conf.clean.1"
+  changed_when: False
+
+- name: "Removing the server blocks from /etc/nginx/nginx.conf"
+  shell: "cat /etc/nginx/nginx.conf.clean.1 | awk \"/server/,/}$/ {next}1\" > /etc/nginx/nginx.conf.clean.2"
+  changed_when: False
+
+- name: "Removing the duplicated empty lines from /etc/nginx/nginx.conf"
+  shell: "cat -s /etc/nginx/nginx.conf.clean.2 > /etc/nginx/nginx.conf.clean.3"
+  changed_when: False
+
+- name: "Save the results back to /etc/nginx/nginx.conf"
+  shell: "mv /etc/nginx/nginx.conf.clean.3 /etc/nginx/nginx.conf"
+  changed_when: False
+
+- name: "Delete the temporary files"
+  file:
+    path: "{{ item }}"
+    state: absent
+  with_items:
+    - "/etc/nginx/nginx.conf.clean"
+    - "/etc/nginx/nginx.conf.clean.1"
+    - "/etc/nginx/nginx.conf.clean.2"
+    - "/etc/nginx/nginx.conf.clean.3"
+
+- name: "Add the line include /etc/nginx/sites-enabled to nginx.conf"
+  lineinfile:
+    path: /etc/nginx/nginx.conf
+    line: "    include /etc/nginx/sites-enabled/*;"
+    regexp: "include .etc.nginx.sites-enabled."
+    insertafter: ".*include.*etc.nginx.conf.d"
+
+- name: "Add the Stream block in /etc/nginx/nginx.conf"
+  blockinfile:
+    path: /etc/nginx/nginx.conf
+    block: |
+      stream {
+              include /etc/nginx/streams.d/*.conf;
+      }
+  when: nginx_conf.stdout.find('streams ') == -1
+
+- name: "List the files in the folder /etc/nginx"
+  shell: ls /etc/nginx
+  register: nginx_list_files
+  changed_when: False
+
+- name: "Nginx Hardening - Create dhparam.pem (will take some minutes)"
+  shell: openssl dhparam -dsaparam -out /etc/nginx/dhparam.pem 4096
+  when: nginx_list_files.stdout.find('dhparam.pem') == -1
+
+- name: "Nginx Hardening - Tell NGINX to only accept protocol TLSv1.2"
+  lineinfile:
+    path: "/etc/nginx/nginx.conf"
+    line: "    ssl_protocols TLSv1.2;"
+    regexp: "ssl_protocols"
+    insertafter: "^http "
+
+- name: "Nginx Hardening - Only accept Hard Ciphers"
+  lineinfile:
+    path: "/etc/nginx/nginx.conf"
+    line: "    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-SHA384;"
+    regexp: "ssl_ciphers"
+    insertafter: "^http "
+
+- name: "Nginx Hardening - Add the dhparam.pem line to nginx.conf"
+  lineinfile:
+    path: /etc/nginx/nginx.conf
+    line: "    ssl_dhparam /etc/nginx/dhparam.pem;"
+    regexp: "ssl_dhparam"
+    insertafter: "^http "    
+
+- name: "Nginx Hardening - Configure the worker_connections in nginx.conf"
+  lineinfile:
+    path: /etc/nginx/nginx.conf
+    line: "    worker_connections {{ worker_connections.stdout }};"
+    regexp: "worker_connections"
+
+- name: "List the sites-available templates availables in this ansible role"
+  local_action: shell ls roles/nginx/templates/sites-available
+  become: no
+  changed_when: False
+  register: sitesavailable_template_list
+
+- name: "List the streams.d templates availables in this ansible role"
+  local_action: shell ls roles/nginx/templates/streams.d
+  become: no
+  changed_when: False
+  register: streamds_template_list
+
+- name: Deploy the sites templates that are expected based on the security group name
+  template:
+    src: "sites-available/{{ item }}"
+    dest: "/etc/nginx/sites-available/{{ item }}"
+  with_items:
+    - "{{ sites }}"
+  when: sites is defined and sitesavailable_template_list.stdout.find(item) != -1
+
+- name: Create the symlink for the sites that are available
+  file:
+    src: "/etc/nginx/sites-available/{{ item }}"
+    path: "/etc/nginx/sites-enabled/{{ item }}"
+    state: link
+  with_items:
+    - "{{ sites }}"
+  when: sites is defined and sitesavailable_template_list.stdout.find(item) != -1
+
+- name: "Test the nginx config before restarting"
+  shell: nginx -t
+  changed_when: False
+
+- name: "Reload nginx service"
+  service:
+    name: nginx
+    state: reloaded
+
+- name: "Extract the list of listening ports"
+  shell: "netstat -ntlp | grep -v '127.0.0.1' | grep -i 'nginx\\|java' | head -20"
+  register: netstat
+  changed_when: False
+
+- name: "Show the list of listening ports"
+  vars:
+    msg: "{{ netstat.stdout }}"
+  debug:
+    msg: "{{ msg.split('\n') }}"
