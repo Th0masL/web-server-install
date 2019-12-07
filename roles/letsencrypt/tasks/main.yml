@@ -1,3 +1,7 @@
+# This playbook has been inspired by this tutorial
+# https://linuxize.com/post/secure-nginx-with-let-s-encrypt-on-ubuntu-18-04/
+#
+
 ---
 
 - name: "[UBUNTU/DEBIAN] Add the APT Repository ppa:certbot/certbot for the latest CERTBOT package"
