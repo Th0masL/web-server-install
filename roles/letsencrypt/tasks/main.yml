@@ -1,0 +1,65 @@
+---
+
+- name: "[UBUNTU/DEBIAN] Add the APT Repository ppa:certbot/certbot for the latest CERTBOT package"
+  apt_repository:
+    repo: "ppa:certbot/certbot"
+  when: ansible_os_family == "Debian"
+
+- name: "[UBUNTU/DEBIAN] Update APT cache"
+  apt:
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+  changed_when: False
+
+- name: "[UBUNTU/DEBIAN] Install certbot with APT"
+  apt:
+    name: certbot
+  when: ansible_os_family == "Debian"
+
+- name: "Try to find the username that will be running the NGINX service"
+  shell: "cat /etc/passwd | grep -E \"nginx|www-data|www-admin\" | awk -F ':' '{print $1}' | head -1"
+  register: nginx_user_result
+  changed_when: False
+
+- name: "Save this nginx user in a nice variable"
+  set_fact:
+    nginx_user: "{{ nginx_user_result.stdout }}"
+
+- name: "Create the folders for letsencrypt"
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ nginx_user }}"
+    group: "{{ nginx_user }}"
+  with_items:
+    - /var/lib/letsencrypt
+    - /var/lib/letsencrypt/.well-known
+
+- name: "Create the file /etc/nginx/snippets/letsencrypt.conf that we will include in the Virtual Hosts to enable LetsEncrypt easily"
+  blockinfile:
+    path: /etc/nginx/snippets/letsencrypt.conf
+    create: yes
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - LETSENCRYPT"
+    block: |
+      location ^~ /.well-known/acme-challenge/ {
+        allow all;
+        root /var/lib/letsencrypt/;
+        default_type "text/plain";
+        try_files $uri =404;
+      }
+
+- name: "Create the bash script that will renew the certificates"
+  copy:
+    src: "files/certbot_renew_certificates.sh"
+    dest: "/scripts/certbot_renew_certificates.sh"
+    owner: root
+    group: root
+    mode: 0775
+
+- name: "Schedule the certificate renewal script every week"
+  cron:
+    name: Renew Certbot Certificates
+    weekday: "0"
+    hour: "8"
+    minute: "0"
+    job: "/scripts/certbot_renew_certificates.sh"

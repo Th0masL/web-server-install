@@ -6,4 +6,8 @@
   become_user: root
 
   roles:
-    - nginx-server-install.yml
+    - nginx-server-install
+    - php-fpm-install
+    - letsencrypt
+    - nginx-deploy-websites
+

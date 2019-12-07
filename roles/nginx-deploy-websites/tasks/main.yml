@@ -1,0 +1,231 @@
+---
+
+- name: Show warning if we can't find the file vars/main.yml
+  debug:
+    msg: "Unable to find the file vars/main.yml. Please make sure that you have renamed the file vars/mail.yml.exemple to vars/main.yml"
+  when: www_data_folder is not defined
+  failed_when: True
+
+- name: "Try to find the username that will be running the NGINX service"
+  shell: "cat /etc/passwd | grep -E \"nginx|www-data|www-admin\" | awk -F ':' '{print $1}' | head -1"
+  register: nginx_user_result
+  changed_when: False
+
+- name: "Save this nginx user in a nice variable"
+  set_fact:
+    nginx_user: "{{ nginx_user_result.stdout }}"
+
+- name: "Show the nginx user that we will configure in the template nginx.conf"
+  debug:
+    msg: "nginx_user : {{ nginx_user }}"
+
+- name: "Extract the sites-available for this server"
+  become: no
+  local_action: "shell find ./ -type f -name \"*.conf\" | grep \"roles/{{ role_path|basename }}/templates/sites-available/{{ ansible_hostname }}\" | awk -F '/' '{print $NF}' | sed -e 's/.conf$//g' | head -50"
+  register: sitesavailable_list
+  changed_when: False
+
+- name: "Show the list of sites-avialble that we have found for this server"
+  debug:
+    msg: "{{ sitesavailable_list.stdout.split('\n') }}"
+
+- name: "Extract the streams.d for this server"
+  become: no
+  local_action: "shell find ./ -type f -name \"*.conf\" | grep \"roles/{{ role_path|basename }}/templates/streams.d/{{ ansible_hostname }}\" | awk -F '/' '{print $NF}' | head -50"
+  register: streamsd_list
+  changed_when: False
+
+- name: "Show the list of streams.d that we have found for this server"
+  debug:
+    msg: "{{ streamsd_list.stdout.split('\n') }}"
+
+- name: "Deploy the sites-available templates that are expected, based on this server's name"
+  template:
+    src: "sites-available/{{ ansible_hostname }}/{{ item }}.conf"
+    dest: "/etc/nginx/sites-available/{{ item }}.conf"
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when: sitesavailable_list.stdout != ""
+
+- name: "Create the folder that will contain the data of those websites, in the folder {{ www_data_folder }}"
+  file:
+    path: "{{ www_data_folder }}/{{ item }}"
+    state: directory
+    owner: "{{ nginx_user }}"
+    group: "{{ nginx_user }}"
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when: sitesavailable_list.stdout != ""
+
+- name: "Create some empty index.html files in each Virtual Host folder in {{ www_data_folder }}"
+  file:
+    path: "{{ www_data_folder }}/{{ item }}/index.html"
+    state: touch
+    owner: "{{ nginx_user }}"
+    group: "{{ nginx_user }}"
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when: sitesavailable_list.stdout != ""
+
+- name: "Check if we plan to use LetsEncrypt or not"
+  stat:
+    path: /etc/nginx/snippets/letsencrypt.conf
+  register: snippets_letsencrypt
+
+- name: "Delete temporary file"
+  file:
+    path: /tmp/published_domains.txt
+    state: absent
+  changed_when: False
+
+- name: "[IF LETSENCRYPT] Get the Public IP of this machine"
+  shell: curl --silent http://ipinfo.io | jq -r .ip | grep -E '[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}' | head -1
+  register: public_ip
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+  changed_when: False
+
+- name: "[IF LETSENCRYPT] Detect which of those domains are indeed already published on this Public IP"
+  shell: "dig @8.8.8.8 {{ item }} | grep -v ';$' | grep '{{ public_ip.stdout }}' >> /tmp/published_domains.txt"
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+  changed_when: False
+
+- name: "[IF LETSENCRYPT] Extract the list of domains that are published on this server"
+  shell: "cat /tmp/published_domains.txt"
+  register: published_domains
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+  changed_when: False
+
+- name: "[IF LETSENCRYPT] If LetsEncrypt is installed, and the Virtual Host is published online, declare the LetsEncrypt settings the Virtual Host Config"
+  lineinfile:
+    path: "/etc/nginx/sites-available/{{ item }}.conf"
+    line: "    include snippets/letsencrypt.conf;"
+    regexp: "include snippets/letsencrypt.conf;"
+    insertafter: "# Lets Encrypt Settings"
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+    - published_domains.stdout.find(item) != -1
+
+- name: "[IF LETSENCRYPT] If LetsEncrypt is installed, and the Virtual Host is published online, request the certificate"
+  shell: "certbot certonly --agree-tos --email admin@{{ item }} --webroot -w /var/lib/letsencrypt/ -d {{ item }} --quiet"
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+    - published_domains.stdout.find(item) != -1
+
+- name: "[IF LETSENCRYPT] If LetsEncrypt is installed, and the Virtual Host is published online, convert the 'listen 80' line to 443"
+  lineinfile:
+    path: "/etc/nginx/sites-available/{{ item }}.conf"
+    line: "    listen 443 ssl; # managed by Certbot"
+    regexp: "listen 80;$"
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+    - published_domains.stdout.find(item) != -1
+
+- name: "[IF LETSENCRYPT] If LetsEncrypt is installed, and the Virtual Host is published online, declare the fullchain.pem file"
+  lineinfile:
+    path: "/etc/nginx/sites-available/{{ item }}.conf"
+    insertafter: "# Lets Encrypt Settings"
+    line: "    ssl_certificate /etc/letsencrypt/live/{{ item }}/fullchain.pem; # managed by Certbot"
+    regexp: "ssl_certificate "
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+    - published_domains.stdout.find(item) != -1
+
+- name: "[IF LETSENCRYPT] If LetsEncrypt is installed, and the Virtual Host is published online, declare the privkey.pem file"
+  lineinfile:
+    path: "/etc/nginx/sites-available/{{ item }}.conf"
+    insertafter: "# Lets Encrypt Settings"
+    line: "    ssl_certificate_key /etc/letsencrypt/live/{{ item }}/privkey.pem; # managed by Certbot"
+    regexp: "ssl_certificate_key "
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+    - published_domains.stdout.find(item) != -1
+
+- name: "[IF LETSENCRYPT] If LetsEncrypt is installed, and the Virtual Host is published online, re-add the HTTP80 Block"
+  blockinfile:
+    path: "/etc/nginx/sites-available/{{ item }}.conf"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - CERTBOT HTTP BLOCK"
+    insertbefore: "^server "
+    block: |
+      server {
+          if ($host = {{ item }}) {
+              return 301 https://$host$request_uri;
+          } # managed by Certbot
+          listen 80;
+          server_name {{ item }};
+          return 404; # managed by Certbot
+      }
+  with_items:
+    - "{{ sitesavailable_list.stdout.split('\n') }}"
+  when:
+    - sitesavailable_list.stdout != ""
+    - snippets_letsencrypt.stat.exists is defined and snippets_letsencrypt.stat.exists == True
+    - published_domains.stdout.find(item) != -1
+
+- name: "Deploy the streams.d templates that are expected, based on this server's name"
+  template:
+    src: "streams.d/{{ ansible_hostname }}/{{ item }}"
+    dest: "/etc/nginx/streams.d/{{ item }}"
+  with_items:
+    - "{{ streamsd_list.stdout.split('\n') }}"
+  when: streamsd_list.stdout != ""
+
+- name: "List the .conf files in the folder /etc/nginx/sites-available"
+  shell: "ls /etc/nginx/sites-available/ | grep \"\\.conf$\" | head -100"
+  register: nginx_sitesavailable
+  changed_when: False
+
+- name: "Show the list of sites-available"
+  debug:
+    msg: "{{ nginx_sitesavailable.stdout.split('\n') }}"
+
+- name: Create the symlink for each of the sites present in the sites-available folder
+  file:
+    src: "/etc/nginx/sites-available/{{ item }}"
+    path: "/etc/nginx/sites-enabled/{{ item }}"
+    state: link
+  with_items:
+    - "{{ nginx_sitesavailable.stdout.split('\n') }}"
+  when: nginx_sitesavailable.stdout != ""
+
+- name: "Test the nginx config before restarting"
+  shell: nginx -t
+  changed_when: False
+
+- name: "Reload nginx service"
+  service:
+    name: nginx
+    state: reloaded
+
+- name: "Extract the list of listening ports"
+  shell: "netstat -ntlp | grep -i 'nginx' | head -20"
+  register: netstat
+  changed_when: False
+
+- name: "Show the list of listening ports"
+  vars:
+    msg: "{{ netstat.stdout }}"
+  debug:
+    msg: "{{ msg.split('\n') }}"

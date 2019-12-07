@@ -1,0 +1,127 @@
+---
+
+- name: Show warning if we can't find the file vars/main.yml
+  debug:
+    msg: "Unable to find the file vars/main.yml. Please make sure that you have renamed the file vars/mail.yml.exemple to vars/main.yml"
+  when: www_data_folder is not defined
+  failed_when: True
+
+- name: "Test the nginx config before starting to try to install php"
+  shell: nginx -t
+  changed_when: False
+
+- name: "[UBUNTU/DEBIAN] Add the APT Repository ppa:ondrej/php for the latest PHP packages"
+  apt_repository:
+    repo: "ppa:ondrej/php"
+  when: ansible_os_family == "Debian"
+
+- name: "[UBUNTU/DEBIAN] Update APT cache"
+  apt:
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+  changed_when: False
+
+- name: "[UBUNTU/DEBIAN] Install php-fpm with APT"
+  apt:
+    name: php-fpm
+  when: ansible_os_family == "Debian"
+
+- name: "[UBUNTU/DEBIAN] Install php-mysql with APT"
+  apt:
+    name: php-mysql
+  when: ansible_os_family == "Debian"
+
+- name: "[RedHat/CentOS/AmazonLinux] Install nginx with YUM"
+  yum:
+    name: "{{ packages }}"
+  vars:
+    packages:
+    - php-fpm
+    - php-mysql
+  when: ansible_os_family == "RedHat"
+
+- name: "Extract the PHP version"
+  shell: "php -v 2>&1 | grep -oE \"^PHP [0-9][0-9]*.[0-9][0-9]*\" | awk '{print $2}' | head -1"
+  register: php_version_result
+  changed_when: False
+
+- name: "Save this PHP version in a nice variable"
+  set_fact:
+    php_version: "{{ php_version_result.stdout }}"
+
+- name: "Show the PHP version"
+  debug:
+    msg: "php_version : {{ php_version }}"
+
+- name: "Check if the SystemD service file /lib/systemd/system/php{{ php_version }}-fpm.service exists or not"
+  stat:
+    path: "/lib/systemd/system/php{{ php_version }}-fpm.service"
+  register: systemd_service_file
+
+- name: "Check if the InitD service file /etc/init.d/php{{ php_version }}-fpm exists or not"
+  stat:
+    path: "/etc/init.d/php{{ php_version }}-fpm"
+  register: initd_service_file
+
+- name: "If both SYSTEMD and INITD services files exists, delete the INIT.D service file /etc/init.d/php{{ php_version }}-fpm, to force using the SYSTEMD one"
+  file:
+    path: "/etc/init.d/php{{ php_version }}-fpm"
+    state: absent
+  when: systemd_service_file.stat.exists == True and initd_service_file.stat.exists == True
+
+- name: "Reload systemd daemon to make sure we are using the SYSTEMD service file"
+  systemd:
+    daemon_reload: yes
+  when: systemd_service_file.stat.exists == True and initd_service_file.stat.exists == True
+
+- name: "Make sure php{{ php_version }}-fpm service is enabled on boot"
+  service:
+    name: php{{ php_version }}-fpm
+    enabled: yes
+
+- name: "PHP Hardening - Disable cgi.fix_pathinfo"
+  lineinfile:
+    path: "/etc/php/{{ php_version }}/fpm/php.ini"
+    line: "cgi.fix_pathinfo=0"
+    regexp: "^[;]*cgi.fix_pathinfo="
+  register: cgi_fix_pathinfo
+
+- name: "Restart php{{ php_version }}-fpm service"
+  service:
+    name: "php{{ php_version }}-fpm"
+    state: restarted
+  when: cgi_fix_pathinfo.changed == True
+
+- name: "Copy the file phpinfo.php to /var/www/html"
+  copy:
+    src: files/phpinfo.php
+    dest: "/var/www/html/phpinfo.php"
+
+- name: "Create the file conf.d/php-fpm that we will include in the Virtual Hosts to enable PHP easily"
+  blockinfile:
+    path: /etc/nginx/conf.d/php-fpm
+    create: yes
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - PHP"
+    block: |
+      location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php{{ php_version }}-fpm.sock;
+      }
+      location ~ /\.ht {
+        deny all;
+      }
+
+- name: "Declare the PHP INCLUDE LINE in the default website sites-available/default.conf"
+  blockinfile:
+    path: /etc/nginx/sites-available/default.conf
+    marker: "    # {mark} ANSIBLE MANAGED BLOCK - ENABLE PHP"
+    insertafter: "# Additionnal settings"
+    block: |2
+          include /etc/nginx/conf.d/php-fpm;
+  register: block_inserted
+
+- name: "Reload nginx service"
+  service:
+    name: "nginx"
+    state: reloaded
+  when: block_inserted.changed == True
